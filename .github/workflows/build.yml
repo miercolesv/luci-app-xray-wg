@@ -241,7 +241,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: apk-tools, path: bin }
       - name: Make apk-tools executable
-        run: chmod +x bin/apk
+        # The artifact holds a file named apk-tools, so it lands at bin/apk-tools.
+        run: chmod +x bin/apk-tools && bin/apk-tools --version
 
       - name: Build the signed repository index
         env:
@@ -258,7 +259,7 @@ jobs:
           cp keys/xray-wg-repo.pub.pem "$RUNNER_TEMP/trust/"
           # --keys-dir must be an absolute path: apk silently loads no keys
           # from a relative one, and then rejects everything as UNTRUSTED.
-          ( cd site && "$GITHUB_WORKSPACE/bin/apk" mkndx \
+          ( cd site && "$GITHUB_WORKSPACE/bin/apk-tools" mkndx \
               --keys-dir "$RUNNER_TEMP/trust" \
               --sign-key "$RUNNER_TEMP/sign.pem" \
               --output packages.adb *.apk )
