@@ -1,0 +1,12 @@
+# Never commit signing material. The private key lives only in the
+# APK_SIGN_KEY GitHub Actions secret and on the maintainer's machine.
+*.private.pem
+private-key.pem
+key-build*
+*.key
+
+# Build output
+/dist/
+/build/
+/bin/
+/tmp/

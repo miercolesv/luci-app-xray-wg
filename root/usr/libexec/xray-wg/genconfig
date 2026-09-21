@@ -1,0 +1,176 @@
+#!/usr/bin/env ucode
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Emits an xray-core configuration on stdout from the xray_wg UCI package.
+//
+// Three details in the emitted config look like mistakes and are not - they
+// match what xray actually accepts, and "fixing" them breaks the tunnel:
+//
+//   * inbounds[0].port is a STRING while inbounds[0].settings.port is a NUMBER
+//   * "Pragma" is a bare string while every sibling header is an array
+//
+
+// For TCP mode, streamSettings.security, quicSettings and tlsSettings are
+// omitted entirely rather than set to empty values.
+
+'use strict';
+
+import { cursor } from 'uci';
+import { readfile } from 'fs';
+
+// The VMess user id and the WireGuard ingest port are per-deployment. They
+// come from UCI when set, otherwise from a fetched server list that publishes
+// them under config.ports.v2ray. Nothing is compiled in: a wrong constant
+// would produce a silent connection failure, so an unresolvable value is a
+// hard error instead.
+const CACHE_FILE = '/etc/xray-wg/servers.json';
+
+const USER_AGENTS = [
+	'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.75 Safari/537.36',
+	'Mozilla/5.0 (iPhone; CPU iPhone OS 10_0_2 like Mac OS X) AppleWebKit/601.1 (KHTML, like Gecko) CriOS/53.0.2785.109 Mobile/14A456 Safari/601.1.46'
+];
+
+// Returns { uuid, port } from the newest server list on disk; either key is
+// absent when the file is missing, unparsable or shaped differently than
+// expected. Never fails: the constants above cover every gap.
+function fleetParams() {
+	for (let path in [ CACHE_FILE ]) {
+		let raw = readfile(path);
+		if (type(raw) != 'string')
+			continue;
+
+		let data;
+		try {
+			data = json(raw);
+		} catch (e) {
+			continue;
+		}
+
+		if (type(data) != 'object' || type(data.config) != 'object' ||
+		    type(data.config.ports) != 'object')
+			continue;
+
+		let v2 = data.config.ports.v2ray;
+		if (type(v2) != 'object')
+			continue;
+
+		let out = {};
+
+		if (type(v2.id) == 'string' && match(v2.id, /^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/))
+			out.uuid = v2.id;
+
+		if (type(v2.wireguard) == 'array' && type(v2.wireguard[0]) == 'object') {
+			let p = int(v2.wireguard[0].port);
+			if (p >= 1 && p <= 65535)
+				out.port = p;
+		}
+
+		return out;
+	}
+	return {};
+}
+
+function fail(msg) {
+	warn(`genconfig: ${msg}\n`);
+	exit(1);
+}
+
+const uci = cursor();
+uci.load('xray_wg');
+
+function opt(section, option) {
+	let v = uci.get('xray_wg', section, option);
+	return (v == null) ? '' : trim(`${v}`);
+}
+
+function required(section, option) {
+	let v = opt(section, option);
+	if (v == '')
+		fail(`xray_wg.${section}.${option} is not set`);
+	return v;
+}
+
+function port(value, what) {
+	let n = int(value);
+	// int() yields NaN, not null, for unconvertible input, and every
+	// comparison against NaN is false - so the test must be inverted to
+	// fail closed.
+	if (!(n >= 1 && n <= 65535))
+		fail(`${what} is not a valid port: '${value}'`);
+	return n;
+}
+
+const mode = opt('settings', 'mode') || 'tcp';
+if (mode != 'tcp')
+	fail(`mode '${mode}' is not implemented; only 'tcp' is supported`);
+
+// Kept as a string: the reference config quotes the inbound port.
+const localPort = required('settings', 'local_port');
+port(localPort, 'settings.local_port');
+
+const vmessPort = port(required('server', 'frontend_port'), 'server.frontend_port');
+const wgHost = required('server', 'host');
+const frontend = required('server', 'frontend');
+const httpHost = required('settings', 'http_host');
+const loglevel = opt('settings', 'loglevel') || 'warning';
+
+const fleet = fleetParams();
+
+const vmessUuid = opt('server', 'uuid') || fleet.uuid || '';
+if (vmessUuid == '')
+	fail('no VMess id: set server.uuid, or fetch a server list that publishes one');
+if (!match(vmessUuid, /^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/))
+	fail(`server.uuid is not a UUID: '${vmessUuid}'`);
+
+const ingestPort = port(opt('server', 'wg_port') || `${fleet.port ?? ''}`,
+                        'server.wg_port');
+
+const config = {
+	log: { loglevel: loglevel },
+	inbounds: [ {
+		port: localPort,
+		protocol: 'dokodemo-door',
+		settings: {
+			address: wgHost,
+			port: ingestPort,
+			network: 'udp'
+		}
+	} ],
+	outbounds: [ {
+		tag: 'proxy',
+		protocol: 'vmess',
+		settings: {
+			vnext: [ {
+				address: frontend,
+				port: vmessPort,
+				users: [ {
+					id: vmessUuid,
+					alterId: 0,
+					security: 'none'
+				} ]
+			} ]
+		},
+		streamSettings: {
+			network: 'tcp',
+			tcpSettings: {
+				header: {
+					type: 'http',
+					request: {
+						version: '1.1',
+						method: 'GET',
+						path: [ '/' ],
+						headers: {
+							'Host': [ httpHost ],
+							'User-Agent': USER_AGENTS,
+							'Accept-Encoding': [ 'gzip, deflate' ],
+							'Connection': [ 'keep-alive' ],
+							'Pragma': 'no-cache'
+						}
+					}
+				}
+			}
+		}
+	} ]
+};
+
+printf('%J\n', config);

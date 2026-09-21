@@ -1,0 +1,61 @@
+# WireGuard carried inside an xray VMess transport.
+#
+# Normally edited from LuCI (VPN -> Xray WireGuard), not by hand.
+#
+# Works with a server you run yourself (see docs/SELF-HOSTING.md) or with a
+# hosted provider. Nothing here is preset for any particular provider: fill in
+# the server fields by hand, or set settings.list_url to an endpoint that
+# publishes them and use "Refresh server list" in the UI.
+
+config settings 'settings'
+	option enabled '0'
+	# 'tcp' is the only transport implemented so far.
+	option mode 'tcp'
+	# Loopback UDP port where WireGuard hands packets to xray. Pinned rather
+	# than random so the WireGuard peer endpoint is stable across restarts.
+	option local_port '61554'
+	# Host header used by the HTTP-disguised TCP transport. Must match what
+	# the server expects.
+	option http_host 'www.example.com'
+	# Logical netifd interface carrying the real uplink. Auto-detected at
+	# install time; do not assume it is called 'wan'.
+	option upstream_iface ''
+	option loglevel 'warning'
+	# Optional. An endpoint publishing a server list in the schema the
+	# backend understands: any object carrying host + public_key + v2ray,
+	# and optionally config.ports.v2ray for the shared id and ingest port.
+	option list_url ''
+
+config server 'server'
+	option name ''
+	# Address of the WireGuard server. xray dials this through the tunnel;
+	# WireGuard itself never learns it.
+	option host ''
+	# Port the WireGuard server listens on, at that address.
+	option wg_port ''
+	# Address running the VMess frontend.
+	option frontend ''
+	option frontend_port '80'
+	# VMess user id. Fill in for a self-hosted server, or let a fetched
+	# server list supply it.
+	option uuid ''
+	# WireGuard peer public key of the server.
+	option public_key ''
+	option dns_name ''
+
+config wireguard 'wg'
+	# Name of the netifd interface this package creates and manages.
+	option iface 'xwg0'
+	# REQUIRED. Your WireGuard private key.
+	option private_key ''
+	# REQUIRED. The address assigned to you, with prefix length.
+	option address ''
+	# Resolver to use inside the tunnel, so DNS does not leak upstream.
+	option dns ''
+	# VMess framing inflates packets; the usual 1420 fragments.
+	option mtu '1280'
+	option persistent_keepalive '25'
+
+config firewall 'firewall'
+	option manage '1'
+	option zone_name 'xwgvpn'

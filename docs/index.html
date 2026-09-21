@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>luci-app-xray-wg apk repository</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--fg:#1a1a1a;--bg:#fff;--mut:#666;--line:#e2e2e2;--code:#f6f6f6;--warn:#8a5000;--warnbg:#fff8e6}
+@media (prefers-color-scheme:dark){:root{--fg:#e8e8e8;--bg:#161616;--mut:#a0a0a0;--line:#333;--code:#212121;--warn:#ffc46b;--warnbg:#2a2210}}
+*{box-sizing:border-box}
+body{margin:0 auto;padding:2.5rem 16px 4rem;max-width:44rem;background:var(--bg);color:var(--fg);
+ font:16px/1.65 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+h1{font-size:1.6rem;margin:0 0 .3rem}
+h2{font-size:1.1rem;margin:2.2rem 0 .6rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+.sub{color:var(--mut);margin:0 0 1.5rem}
+pre{background:var(--code);padding:.85rem 1rem;border-radius:6px;overflow-x:auto;font-size:.85rem;line-height:1.5}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+p code,li code{background:var(--code);padding:.1em .35em;border-radius:3px;font-size:.88em}
+.warn{background:var(--warnbg);border-left:3px solid var(--warn);padding:.8rem 1rem;border-radius:0 6px 6px 0;margin:1.2rem 0}
+.warn strong{color:var(--warn)}
+a{color:inherit}
+footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--line);color:var(--mut);font-size:.85rem}
+</style>
+
+<h1>luci-app-xray-wg</h1>
+<p class="sub">An apk repository for OpenWrt. WireGuard carried inside an xray VMess transport, configured from LuCI.</p>
+
+<div class="warn">
+<strong>Read this first.</strong> The tunnel itself was tested end to end against a
+real server, but <strong>never on OpenWrt hardware</strong>. A signature proves a package
+came from this project's key — not that the software is correct or safe. Obfuscation hides
+VPN use from your network and ISP, not from the sites you visit.
+</div>
+
+<h2>Add the repository</h2>
+<p>The package is <code>noarch</code>, so this one repository serves every router. Needs OpenWrt 24.10+ using <code>apk</code>.</p>
+<pre><code>wget -O /etc/apk/keys/xray-wg-repo.pub.pem \
+  https://miercolesv.github.io/luci-app-xray-wg/xray-wg-repo.pub.pem
+
+echo "https://miercolesv.github.io/luci-app-xray-wg/packages.adb" \
+  >> /etc/apk/repositories.d/customfeeds.list
+
+apk update
+apk add luci-app-xray-wg</code></pre>
+
+<h2>Or install a single file, no shell</h2>
+<p>Download the <code>.apk</code> from
+<a href="https://github.com/miercolesv/luci-app-xray-wg/releases">Releases</a> and upload it
+under <strong>System → Software</strong> in LuCI. Adding the repository above is only worth it
+if you want <code>apk update</code> to offer upgrades.</p>
+
+<h2>Verify the key</h2>
+<pre><code>openssl rsa -pubin -in /etc/apk/keys/xray-wg-repo.pub.pem \
+  -outform DER | sha256sum</code></pre>
+<p>Compare against the fingerprint printed in the repository's <code>keys/README.md</code>.</p>
+
+<h2>Then</h2>
+<p>Open <strong>VPN → Xray WireGuard</strong> in LuCI. For your own server, pick the
+<em>Self-hosted / manual</em> profile and fill in the fields — the
+<a href="https://github.com/miercolesv/luci-app-xray-wg/blob/main/docs/SELF-HOSTING.md">self-hosting
+guide</a> covers the server side. Then paste a wg-quick config and press Connect. Nothing
+else needs a shell.</p>
+
+<footer>
+<a href="https://github.com/miercolesv/luci-app-xray-wg">Source and issues on GitHub</a>
+ · GPL-3.0-or-later
+</footer>

@@ -1,0 +1,273 @@
+name: build
+
+# On demand, and automatically for a version tag.
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_url:
+        description: OpenWrt/ImmortalWrt SDK tarball URL
+        required: false
+        default: https://downloads.immortalwrt.org/releases/25.12.2/targets/qualcommax/ipq60xx/immortalwrt-sdk-25.12.2-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+      sdk_sha256:
+        description: SHA-256 of that tarball (required if you change sdk_url)
+        required: false
+        default: 7fa94d4aff00906cbbcc9a2fa3f836d2b7f7b37915627e233950ffee6fca4140
+      publish:
+        description: Publish the signed apk repository to GitHub Pages
+        type: boolean
+        default: false
+  push:
+    tags: [ 'v*' ]
+  pull_request:
+    paths-ignore: [ '**.md' ]
+
+permissions:
+  contents: read
+
+env:
+  PKG: luci-app-xray-wg
+  DEFAULT_SDK_URL: https://downloads.immortalwrt.org/releases/25.12.2/targets/qualcommax/ipq60xx/immortalwrt-sdk-25.12.2-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  DEFAULT_SDK_SHA256: 7fa94d4aff00906cbbcc9a2fa3f836d2b7f7b37915627e233950ffee6fca4140
+
+jobs:
+  build:
+    # x86_64 on purpose: the published SDKs are x86_64-only, and xray-core's Go
+    # toolchain refuses to bootstrap on an arm64 host.
+    runs-on: ubuntu-24.04
+    outputs:
+      apk_name: ${{ steps.build.outputs.apk_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pkgsrc
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3-setuptools rsync swig unzip \
+            zlib1g-dev file wget zstd xz-utils pkg-config
+
+      - name: Resolve SDK inputs
+        id: sdk
+        run: |
+          url="${{ github.event.inputs.sdk_url }}"; [ -n "$url" ] || url="$DEFAULT_SDK_URL"
+          sum="${{ github.event.inputs.sdk_sha256 }}"; [ -n "$sum" ] || sum="$DEFAULT_SDK_SHA256"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sum=$sum" >> "$GITHUB_OUTPUT"
+          echo "key=$(printf '%s' "$url" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache SDK tarball
+        uses: actions/cache@v4
+        with:
+          path: sdk.tar.zst
+          key: sdk-${{ steps.sdk.outputs.key }}-${{ steps.sdk.outputs.sum }}
+
+      - name: Download and verify SDK
+        run: |
+          set -eu
+          if [ ! -f sdk.tar.zst ]; then
+            wget -q -O sdk.tar.zst "${{ steps.sdk.outputs.url }}"
+          fi
+          echo "${{ steps.sdk.outputs.sum }}  sdk.tar.zst" | sha256sum -c -
+          mkdir -p sdk
+          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Update feeds
+        working-directory: sdk
+        run: |
+          set -eu
+          ./scripts/feeds update base luci packages
+          # The luci feed clone is the one that intermittently comes back empty.
+          if [ ! -f feeds/luci/luci.mk ]; then
+            echo "::warning::luci feed incomplete, cloning it directly"
+            rm -rf feeds/luci
+            commit=$(sed -n 's|.*luci\.git\^\([0-9a-f]\{40\}\).*|\1|p' feeds.conf.default)
+            git clone -q https://github.com/immortalwrt/luci.git feeds/luci
+            [ -n "$commit" ] && git -C feeds/luci checkout -q "$commit"
+          fi
+          test -f feeds/luci/luci.mk
+          ./scripts/feeds install -a
+
+      - name: Stage the package
+        run: cp -r pkgsrc "sdk/package/$PKG"
+
+      - name: Configure, and fail on unmet dependencies
+        working-directory: sdk
+        run: |
+          set -eu
+          echo "CONFIG_PACKAGE_$PKG=m" >> .config
+          make defconfig > defconfig.log 2>&1 || { tail -40 defconfig.log; exit 1; }
+          # A dependency naming a package that no feed provides would install a
+          # broken package on the router, so treat it as a build failure.
+          if grep -E "Makefile 'package/$PKG/Makefile' has a (build )?dependency on" defconfig.log; then
+            echo "::error::unmet dependency in $PKG/Makefile (see above)"
+            exit 1
+          fi
+          grep -q "CONFIG_PACKAGE_$PKG=m" .config
+
+      - name: Build host tools (jsmin, po2lmo)
+        working-directory: sdk
+        # Without jsmin the JS minify step leaves 0-byte .js.o files in the package.
+        run: |
+          set -eu
+          make -r -C feeds/luci/modules/luci-base TOPDIR="$PWD" \
+            BUILD_SUBDIR="feeds/luci/modules/luci-base" BUILD_VARIANT="" ALL_VARIANTS="" \
+            host-compile SILENT=1 > hosttools.log 2>&1 || { tail -30 hosttools.log; exit 1; }
+          test -x staging_dir/host/bin/jsmin
+
+      - name: Build the package
+        id: build
+        working-directory: sdk
+        # Built directly rather than through the dependency graph: the package is
+        # noarch with no compiled content, and the graph would build xray-core's
+        # entire Go toolchain for nothing. Dependencies were validated above.
+        run: |
+          set -eu
+          export PATH="$PWD/staging_dir/host/bin:$PATH"
+          make -r -C "package/$PKG" TOPDIR="$PWD" BUILD_SUBDIR="package/$PKG" \
+            BUILD_VARIANT="" ALL_VARIANTS="" clean compile SILENT=1 > build.log 2>&1 \
+            || { tail -40 build.log; exit 1; }
+          apk=$(find bin -name "$PKG-*.apk" | head -1)
+          [ -n "$apk" ] || { echo "::error::no package produced"; tail -40 build.log; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$apk" "$GITHUB_WORKSPACE/out/"
+          echo "apk_name=$(basename "$apk")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the package
+        working-directory: sdk
+        run: |
+          set -eu
+          apk="$GITHUB_WORKSPACE/out/${{ steps.build.outputs.apk_name }}"
+          staging_dir/host/bin/apk adbdump "$apk" > manifest.txt
+          grep -q '^  arch: noarch' manifest.txt || { echo "::error::package is not noarch"; exit 1; }
+          for d in luci-base xray-core wireguard-tools kmod-wireguard ucode \
+                   ucode-mod-uci ucode-mod-fs jsonfilter curl ca-bundle; do
+            grep -qE "^    - $d\$" manifest.txt || { echo "::error::missing dependency: $d"; exit 1; }
+          done
+          if grep -qE 'name: .*\.js\.o' manifest.txt; then
+            echo "::error::stray .js.o files in package (jsmin did not run)"; exit 1
+          fi
+          sed -n '/^info:/,/^paths:/p' manifest.txt
+
+      - name: Sign the package (apk adbsign)
+        working-directory: sdk
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          set -eu
+          if [ -z "${APK_SIGN_KEY:-}" ]; then
+            echo "::warning::APK_SIGN_KEY not set - publishing an unsigned package"
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$APK_SIGN_KEY" > "$RUNNER_TEMP/sign.pem"
+          # --allow-untrusted refers to the *input*: mkpkg leaves it unsigned.
+          # Without it adbsign truncates the file instead of signing it.
+          staging_dir/host/bin/apk adbsign --allow-untrusted \
+            --sign-key "$RUNNER_TEMP/sign.pem" \
+            "$GITHUB_WORKSPACE/out/${{ steps.build.outputs.apk_name }}"
+          # Prove it verifies against the committed public key.
+          mkdir -p "$RUNNER_TEMP/trust"
+          cp "$GITHUB_WORKSPACE/pkgsrc/keys/xray-wg-repo.pub.pem" "$RUNNER_TEMP/trust/"
+          # --output must be a regular file: apk 3.0.5 segfaults writing an
+          # index to /dev/null.
+          staging_dir/host/bin/apk mkndx --keys-dir "$RUNNER_TEMP/trust" \
+            --sign-key "$RUNNER_TEMP/sign.pem" --output "$RUNNER_TEMP/verify.adb" \
+            "$GITHUB_WORKSPACE/out/${{ steps.build.outputs.apk_name }}"
+          echo "signature verifies against keys/xray-wg-repo.pub.pem"
+          shred -u "$RUNNER_TEMP/sign.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/sign.pem"
+
+      - name: Checksum
+        run: cd out && sha256sum *.apk | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: out/
+          if-no-files-found: error
+
+      # So the pages job does not have to re-download a 450 MB SDK for one binary.
+      - name: Stash apk-tools for downstream jobs
+        run: cp sdk/staging_dir/host/bin/apk apk-tools
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-tools
+          path: apk-tools
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: luci-app-xray-wg, path: out }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.apk
+            out/SHA256SUMS
+          generate_release_notes: true
+          body: |
+            WireGuard carried inside an xray VMess/TCP transport, driven
+            entirely from LuCI.
+
+            `arch: noarch` - one artifact works on every OpenWrt 24.10+ router.
+
+            Works against a server you run yourself (see docs/SELF-HOSTING.md)
+            or any compatible provider. Not tested on real router hardware;
+            see the README before installing.
+
+  pages:
+    needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: luci-app-xray-wg, path: site }
+
+      - uses: actions/download-artifact@v4
+        with: { name: apk-tools, path: bin }
+      - name: Make apk-tools executable
+        run: chmod +x bin/apk
+
+      - name: Build the signed repository index
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          set -eu
+          [ -n "${APK_SIGN_KEY:-}" ] || { echo "::error::APK_SIGN_KEY required to publish a repository"; exit 1; }
+          umask 077
+          printf '%s\n' "$APK_SIGN_KEY" > "$RUNNER_TEMP/sign.pem"
+          rm -f site/SHA256SUMS
+          cp keys/xray-wg-repo.pub.pem site/
+          # Give apk a directory holding only the key.
+          mkdir -p "$RUNNER_TEMP/trust"
+          cp keys/xray-wg-repo.pub.pem "$RUNNER_TEMP/trust/"
+          # --keys-dir must be an absolute path: apk silently loads no keys
+          # from a relative one, and then rejects everything as UNTRUSTED.
+          ( cd site && "$GITHUB_WORKSPACE/bin/apk" mkndx \
+              --keys-dir "$RUNNER_TEMP/trust" \
+              --sign-key "$RUNNER_TEMP/sign.pem" \
+              --output packages.adb *.apk )
+          shred -u "$RUNNER_TEMP/sign.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/sign.pem"
+          cp docs/index.html site/index.html
+          ls -la site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - id: deploy
+        uses: actions/deploy-pages@v4

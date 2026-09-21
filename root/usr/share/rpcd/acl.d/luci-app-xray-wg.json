@@ -1,0 +1,32 @@
+{
+	"luci-app-xray-wg": {
+		"description": "Grant access to Xray WireGuard configuration",
+		"read": {
+			"ubus": {
+				"luci.xray-wg": [
+					"status",
+					"servers",
+					"exit_ip",
+					"profiles"
+				]
+			},
+			"uci": [
+				"xray_wg",
+				"network"
+			]
+		},
+		"write": {
+			"ubus": {
+				"luci.xray-wg": [
+					"action",
+					"refresh"
+				]
+			},
+			"uci": [
+				"xray_wg",
+				"network",
+				"firewall"
+			]
+		}
+	}
+}

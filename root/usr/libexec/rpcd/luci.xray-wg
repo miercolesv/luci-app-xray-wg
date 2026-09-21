@@ -1,0 +1,317 @@
+#!/usr/bin/env ucode
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// rpcd exec-plugin backend for luci-app-xray-wg.
+//
+// Everything the web UI needs that cannot be done with plain UCI reads:
+// service state, the server list, and the start/stop actions. Validation is
+// delegated to `/etc/init.d/xray-wg validate` so the UI reports exactly
+// what the service itself enforces, rather than a second copy of the rules.
+
+'use strict';
+
+import { popen, readfile, writefile, mkdir, stat, stdin } from 'fs';
+import { cursor } from 'uci';
+
+const PROFILES_FILE = '/usr/share/xray-wg/profiles.json';
+const CACHE_DIR = '/etc/xray-wg';
+const CACHE_FILE = CACHE_DIR + '/servers.json';
+const INIT = '/etc/init.d/xray-wg';
+const STATE_DIR = '/var/run/xray-wg';
+
+// Labels inherited from ancestor objects while walking the server list.
+const LABEL_KEYS = [ 'city', 'country', 'country_code', 'gateway', 'isp' ];
+
+// json() raises on malformed input rather than returning null, and every
+// caller here is parsing something that came off the network or off disk.
+function jsonSafe(raw) {
+	if (type(raw) != 'string' || trim(raw) == '')
+		return null;
+	try {
+		return json(raw);
+	} catch (e) {
+		return null;
+	}
+}
+
+function run(cmd) {
+	let fh = popen(cmd, 'r');
+	if (!fh)
+		return { code: -1, output: '' };
+	let out = fh.read('all') ?? '';
+	let rc = fh.close();
+	return { code: rc, output: out };
+}
+
+function uciCursor() {
+	let c = cursor();
+	c.load('xray_wg');
+	return c;
+}
+
+function opt(c, section, option) {
+	let v = c.get('xray_wg', section, option);
+	return (v == null) ? '' : `${v}`;
+}
+
+// --- service state -----------------------------------------------------------
+
+// Mirrors functions.sh: read the socket table directly rather than depending
+// on netstat/ss being present.
+function udpPortBusy(portStr) {
+	let want = sprintf(':%04X', int(portStr) ?? 0);
+	for (let path in [ '/proc/net/udp', '/proc/net/udp6' ]) {
+		let data = readfile(path);
+		if (!data)
+			continue;
+		let lines = split(data, '\n');
+		for (let i = 1; i < length(lines); i++) {
+			let fields = split(trim(lines[i]), /\s+/);
+			if (length(fields) > 1 && index(fields[1], want) > 0)
+				return true;
+		}
+	}
+	return false;
+}
+
+function handshakeAge(iface) {
+	if (iface == '' || !stat(`/sys/class/net/${iface}`))
+		return null;
+	let r = run(`wg show ${iface} latest-handshakes 2>/dev/null`);
+	let newest = 0;
+	for (let line in split(trim(r.output), '\n')) {
+		let f = split(trim(line), /\s+/);
+		let ts = (length(f) > 1) ? (int(f[1]) ?? 0) : 0;
+		if (ts > newest)
+			newest = ts;
+	}
+	if (newest <= 0)
+		return -1;   // interface up, peer never completed a handshake
+	return time() - newest;
+}
+
+function problems() {
+	let r = run(`${INIT} validate 2>&1`);
+	let out = [];
+	for (let line in split(trim(r.output), '\n')) {
+		line = trim(line);
+		if (line == '' || line == 'ok')
+			continue;
+		push(out, replace(line, /^xray-wg:\s*/, ''));
+	}
+	return out;
+}
+
+function withError(result, msg) {
+	return { servers: result.servers, source: result.source, error: msg };
+}
+
+function labelFor(rec) {
+	if (rec.city && rec.country_code)
+		return `${rec.city}, ${rec.country_code} (${rec.dns_name || rec.host})`;
+	if (rec.city)
+		return `${rec.city} (${rec.dns_name || rec.host})`;
+	return rec.dns_name || rec.host;
+}
+
+function collect(node, ctx, out) {
+	let t = type(node);
+
+	if (t == 'array') {
+		for (let item in node)
+			collect(item, ctx, out);
+		return;
+	}
+	if (t != 'object')
+		return;
+
+	// Carry labels down; a deeper value overrides a shallower one.
+	let local = {};
+	for (let k, v in ctx)
+		local[k] = v;
+	for (let k in LABEL_KEYS)
+		if (type(node[k]) == 'string')
+			local[k] = node[k];
+
+	// All three must be present AND non-empty: an entry missing its key would
+	// be offered in the picker and then rejected at start time, which looks
+	// like a bug rather than like missing data.
+	if (type(node.host) == 'string' && node.host != '' &&
+	    type(node.public_key) == 'string' && node.public_key != '' &&
+	    type(node.v2ray) == 'string' && node.v2ray != '') {
+		let rec = {
+			host: node.host,
+			public_key: node.public_key,
+			v2ray: node.v2ray,
+			dns_name: (type(node.dns_name) == 'string') ? node.dns_name : '',
+			city: local.city ?? '',
+			country: local.country ?? '',
+			country_code: local.country_code ?? ''
+		};
+		rec.label = labelFor(rec);
+		push(out, rec);
+		return;
+	}
+
+	for (let k, v in node)
+		collect(v, local, out);
+}
+
+function readServers() {
+	for (let entry in [ [ CACHE_FILE, 'cache' ] ]) {
+		let raw = readfile(entry[0]);
+		if (!raw)
+			continue;
+		let data = jsonSafe(raw);
+		if (type(data) != 'object' && type(data) != 'array')
+			continue;
+		let found = [];
+		collect(data, {}, found);
+		if (length(found) > 0)
+			return { servers: found, source: entry[1], error: null };
+	}
+	return { servers: [], source: 'none',
+	         error: 'no server list fetched yet' };
+}
+
+// Declared before `methods` on purpose: ucode resolves these names at the
+// point of declaration, so a helper defined below the methods object is
+// invisible to it at call time.
+const methods = {
+
+	status: {
+		call: function() {
+			let c = uciCursor();
+			let iface = opt(c, 'wg', 'iface');
+			let port = opt(c, 'settings', 'local_port');
+			let pinned = stat(`${STATE_DIR}/pinned_route`) ? true : false;
+			let age = handshakeAge(iface);
+
+			return {
+				enabled: (opt(c, 'settings', 'enabled') == '1'),
+				xray_listening: udpPortBusy(port),
+				local_port: port,
+				route_pinned: pinned,
+				iface: iface,
+				iface_up: stat(`/sys/class/net/${iface}`) ? true : false,
+				handshake_age: age,
+				server_name: opt(c, 'server', 'name'),
+				server_host: opt(c, 'server', 'host'),
+				frontend: opt(c, 'server', 'frontend'),
+				upstream: opt(c, 'settings', 'upstream_iface'),
+				problems: problems()
+			};
+		}
+	},
+
+	// Fetched on demand, never polled: it leaves the router over the tunnel.
+	exit_ip: {
+		call: function() {
+			// Deliberately a plain address echo, not a geolocation service:
+			// the question is only "which address does the internet see".
+			let r = run('curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null');
+			let ip = trim(r.output ?? '');
+			if (match(ip, /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/) || index(ip, ':') >= 0)
+				return { ip: ip };
+			return { ip: null, error: 'lookup failed - no DNS inside the tunnel?' };
+		}
+	},
+
+	action: {
+		args: { name: '' },
+		call: function(req) {
+			let name = req.args?.name;
+			if (!(name in [ 'start', 'stop', 'restart' ]))
+				return { success: false, error: 'unknown action' };
+
+			// Refuse rather than half-start, so the UI can show why.
+			if (name != 'stop') {
+				let probs = problems();
+				if (length(probs) > 0)
+					return { success: false, error: 'configuration incomplete', problems: probs };
+			}
+
+			let r = run(`${INIT} ${name} 2>&1`);
+			return { success: (r.code == 0), code: r.code, output: trim(r.output) };
+		}
+	},
+
+	// --- server list ----------------------------------------------------------
+	//
+	// The published schema is not documented here, so rather than hardcoding a
+	// path into the JSON we walk it and collect every object that carries the
+	// three fields this package actually needs, inheriting any human-readable
+	// labels found on the way down.
+
+	servers: {
+		call: function() {
+			return readServers();
+		}
+	},
+
+	// Pre-fill values for the two fields that are awkward to discover by
+	// hand. Purely data: the backend treats every profile the same way.
+	profiles: {
+		call: function() {
+			let data = jsonSafe(readfile(PROFILES_FILE));
+			if (type(data) == 'object' && type(data.profiles) == 'array')
+				return { profiles: data.profiles };
+			return { profiles: [] };
+		}
+	},
+
+	refresh: {
+		call: function() {
+			let c = uciCursor();
+			let url = opt(c, 'settings', 'list_url');
+			if (url == '')
+				return withError(readServers(),
+					'no server list URL configured - set it in Settings, or fill the server fields in by hand');
+			// Only an absolute http(s) URL, and never passed through a shell
+			// metacharacter path.
+			if (!match(url, /^https?:\/\/[A-Za-z0-9._~:\/?#@!$&'()*+,;=%-]+$/))
+				return withError(readServers(), 'server list URL is not a plain http(s) URL');
+			let r = run(`curl -fsS --max-time 20 -- '${replace(url, "'", "")}' 2>/dev/null`);
+			let data = jsonSafe(r.output);
+			if (type(data) != 'object' && type(data) != 'array')
+				return withError(readServers(), 'could not fetch or parse the server list');
+
+			let found = [];
+			collect(data, {}, found);
+			if (length(found) == 0)
+				return withError(readServers(), 'server list fetched but no usable entries found');
+
+			mkdir(CACHE_DIR, 0o755);
+			writefile(CACHE_FILE, trim(r.output));
+			return { servers: found, source: 'api', error: null };
+		}
+	},
+
+};
+
+// --- rpcd exec protocol --------------------------------------------------------
+
+let argv = ARGV;
+
+if (argv[0] == 'list') {
+	let spec = {};
+	for (let name, m in methods)
+		spec[name] = m.args ?? {};
+	printf('%J\n', spec);
+	exit(0);
+}
+
+if (argv[0] == 'call') {
+	let name = argv[1];
+	let m = methods[name];
+	if (!m) {
+		printf('%J\n', { error: 'method not found' });
+		exit(1);
+	}
+	let raw = stdin.read('all') ?? '';
+	let args = jsonSafe(raw) ?? {};
+	printf('%J\n', m.call({ args: (type(args) == 'object') ? args : {} }));
+	exit(0);
+}
+
+exit(1);

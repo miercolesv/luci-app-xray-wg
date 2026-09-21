@@ -1,0 +1,25 @@
+{
+	"_comment": [
+		"Connection profiles. A profile only pre-fills the two fields that are",
+		"awkward to discover by hand: where to fetch a server list, and the Host",
+		"header the frontend expects. Everything else still comes from the list",
+		"or from what you type. Add your own entries here; nothing in the code",
+		"is specific to any of them."
+	],
+	"profiles": [
+		{
+			"id": "manual",
+			"name": "Self-hosted / manual",
+			"list_url": "",
+			"http_host": "",
+			"note": "Fill in the server fields yourself. See docs/SELF-HOSTING.md."
+		},
+		{
+			"id": "p1",
+			"name": "Provider (v5 list API)",
+			"list_url": "https://api.ivpn.net/v5/servers.json",
+			"http_host": "www.inet-telecom.com",
+			"note": "Server list, shared id and ingest port all come from the endpoint."
+		}
+	]
+}

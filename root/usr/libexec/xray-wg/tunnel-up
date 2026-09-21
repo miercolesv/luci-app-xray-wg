@@ -1,0 +1,61 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Second half of service start-up, run detached by the init script.
+#
+# Usage: tunnel-up <generation_token>
+#
+# procd starts the xray instance only after start_service() returns, so the
+# WireGuard bring-up cannot happen inline: it would race the inbound socket.
+# WireGuard would eventually recover on its own (it retries handshakes), but
+# waiting for the dokodemo-door socket keeps the first handshake clean and
+# makes a genuine failure visible in the log instead of looking like a slow
+# connection.
+#
+# The generation token is re-checked before every side effect. A stop or a
+# restart bumps the token, which makes any waiter from an earlier start exit
+# quietly rather than bringing the interface up underneath its successor.
+# Nothing is locked, so a killed waiter leaves no state behind.
+
+. /usr/share/xray-wg/functions.sh
+
+GENERATION="$1"
+
+if ! xwg_generation_is "$GENERATION"; then
+	# Superseded before we even started, or invoked by hand without a token.
+	exit 0
+fi
+
+iface=$(xwg_get wg iface)
+port=$(xwg_get settings local_port)
+frontend=$(xwg_get server v2ray)
+
+xwg_wait_udp_port "$port" 20 "$GENERATION"
+case $? in
+	0) ;;
+	2) exit 0 ;;  # superseded while waiting
+	*)
+		xwg_log err "xray did not open 127.0.0.1:$port within 20s; leaving $iface down"
+		exit 1
+		;;
+esac
+
+xwg_generation_is "$GENERATION" || exit 0
+
+# The uplink can settle after xray starts; re-pin before the tunnel's default
+# route lands, never after.
+xwg_pin_route "$frontend" || {
+	xwg_log err "refusing to bring up $iface without a pinned route to $frontend"
+	exit 1
+}
+
+xwg_firewall_apply
+
+xwg_generation_is "$GENERATION" || exit 0
+
+if ifup "$iface"; then
+	xwg_log info "brought up $iface (peer 127.0.0.1:$port -> $frontend)"
+else
+	xwg_log err "ifup $iface failed"
+	exit 1
+fi

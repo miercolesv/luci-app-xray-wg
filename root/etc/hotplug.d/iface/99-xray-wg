@@ -1,0 +1,39 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Re-pin the /32 host route to the VMess frontend whenever the real uplink
+# changes. Required on setups where the uplink is a WiFi client link that
+# reassociates and can come back on a different gateway.
+#
+# The critical guard: this handler also fires for the tunnel interface itself.
+# Re-pinning on that event would resolve the "upstream" as the tunnel and
+# route xray's own uplink into the tunnel it is building, killing the
+# connection at the moment it succeeds.
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || exit 0
+[ -n "$INTERFACE" ] || exit 0
+
+[ -r /usr/share/xray-wg/functions.sh ] || exit 0
+. /usr/share/xray-wg/functions.sh
+
+xwg_enabled || exit 0
+
+# Never act on our own tunnel.
+[ "$INTERFACE" = "$(xwg_get wg iface)" ] && exit 0
+
+# Only act once the service has actually pinned a route; otherwise start_service
+# owns the pinning and we would race it.
+xwg_is_pinned || exit 0
+
+# Only the interface that is (or has become) the uplink matters.
+upstream=$(xwg_upstream_iface)
+[ "$INTERFACE" = "$upstream" ] || exit 0
+
+frontend=$(xwg_get server frontend)
+[ -n "$frontend" ] || exit 0
+
+# ip route replace is idempotent, so the noisy ifupdate stream is harmless.
+xwg_pin_route "$frontend" || {
+	xwg_log err "re-pin after $ACTION on $INTERFACE failed"
+	exit 1
+}

@@ -1,0 +1,143 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+USE_PROCD=1
+# After network and firewall, before anything that expects the tunnel.
+START=95
+STOP=10
+
+EXTRA_COMMANDS="validate"
+EXTRA_HELP="	validate	Check the configuration without starting anything"
+
+. /usr/share/xray-wg/functions.sh
+
+start_service() {
+	local frontend iface port tries generation
+
+	xwg_enabled || {
+		xwg_log info "disabled in /etc/config/xray_wg; not starting"
+		return 0
+	}
+
+	xwg_validate || {
+		xwg_log err "configuration incomplete; not starting"
+		return 1
+	}
+
+	frontend=$(xwg_get server frontend)
+	iface=$(xwg_get wg iface)
+	port=$(xwg_get settings local_port)
+
+	# A leftover interface from a previous run would hold the default route
+	# while we try to read the real uplink's gateway.
+	ifdown "$iface" 2>/dev/null
+
+	# On restart procd has only just killed the previous xray; give the socket
+	# a moment to clear before calling it a conflict.
+	tries=3
+	while xwg_udp_port_busy "$port" && [ "$tries" -gt 0 ]; do
+		tries=$((tries - 1))
+		sleep 1
+	done
+	if xwg_udp_port_busy "$port"; then
+		xwg_log err "UDP port $port is already in use; pick another settings.local_port"
+		return 1
+	fi
+
+	# Pin before anything can install a default route through the tunnel.
+	xwg_pin_route "$frontend" || return 1
+
+	xwg_sync_network || {
+		xwg_log err "failed to write the WireGuard interface into /etc/config/network"
+		xwg_unpin_route
+		return 1
+	}
+
+	mkdir -p "$XWG_CONF_DIR"
+	if ! "$XWG_GENCONFIG" > "$XWG_XRAY_CONF.new"; then
+		xwg_log err "xray config generation failed"
+		rm -f "$XWG_XRAY_CONF.new"
+		xwg_unpin_route
+		return 1
+	fi
+	chmod 0600 "$XWG_XRAY_CONF.new"
+	mv "$XWG_XRAY_CONF.new" "$XWG_XRAY_CONF"
+
+	procd_open_instance xray
+	procd_set_param command "$XWG_XRAY_BIN" run -c "$XWG_XRAY_CONF"
+	procd_set_param file "$XWG_XRAY_CONF"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_set_param stdout 1
+	procd_set_param pidfile "$XWG_STATE_DIR/xray.pid"
+	procd_close_instance
+
+	# Runs after procd has actually launched xray. See tunnel-up for why this
+	# cannot be inline. The generation token lets a later start invalidate
+	# this waiter instead of racing it.
+	generation=$(xwg_new_generation)
+	/usr/libexec/xray-wg/tunnel-up "$generation" >/dev/null 2>&1 &
+}
+
+stop_service() {
+	local iface
+	iface=$(xwg_get wg iface)
+
+	# Invalidate any tunnel-up still counting down from the previous start,
+	# so it cannot ifup after we have torn things down.
+	xwg_clear_generation
+
+	[ -n "$iface" ] && ifdown "$iface" 2>/dev/null
+	xwg_unpin_route
+	xwg_log info "stopped"
+}
+
+service_triggers() {
+	procd_add_reload_trigger "xray_wg"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+# Report the state the status panel will eventually render.
+status_service() {
+	local iface port frontend
+
+	iface=$(xwg_get wg iface)
+	port=$(xwg_get settings local_port)
+	frontend=$(xwg_get server frontend)
+
+	if xwg_udp_port_busy "$port"; then
+		echo "xray:      listening on 127.0.0.1:$port"
+	else
+		echo "xray:      not listening on 127.0.0.1:$port"
+	fi
+
+	if xwg_is_pinned; then
+		echo "route:     $(ip route get "$frontend" 2>/dev/null | head -n1)"
+	else
+		echo "route:     $frontend/32 not pinned"
+	fi
+
+	if [ -d "/sys/class/net/$iface" ]; then
+		echo "wireguard: $iface up"
+		wg show "$iface" latest-handshakes 2>/dev/null |
+			while read -r peer ts; do
+				if [ "${ts:-0}" -gt 0 ]; then
+					echo "handshake: $(( $(date +%s) - ts ))s ago"
+				else
+					echo "handshake: none yet"
+				fi
+			done
+	else
+		echo "wireguard: $iface down"
+	fi
+}
+
+# Used by the LuCI backend so the UI reports exactly what the service enforces.
+validate() {
+	xwg_validate || return 1
+	echo "ok"
+}

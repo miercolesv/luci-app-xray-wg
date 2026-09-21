@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Auto-detect the uplink once, at install time, while the tunnel definitely
+# is not up. Only the logical interface name is stored; the gateway and device
+# are re-resolved on every use because both can change.
+
+[ -r /usr/share/xray-wg/functions.sh ] || exit 0
+. /usr/share/xray-wg/functions.sh
+
+if [ -z "$(xwg_get settings upstream_iface)" ]; then
+	upstream=$(xwg_detect_upstream "$(xwg_get wg iface)")
+	if [ -n "$upstream" ]; then
+		uci -q set "xray_wg.settings.upstream_iface=$upstream"
+		uci -q commit xray_wg
+		xwg_log info "detected uplink interface '$upstream'"
+	else
+		xwg_log warn "could not detect the uplink interface; set settings.upstream_iface manually"
+	fi
+fi
+
+# The WireGuard private key lives here.
+chmod 0600 /etc/config/xray_wg 2>/dev/null
+
+# The service must be enabled in rc.d so that flipping "Enable" in LuCI is
+# genuinely all the user has to do. It still starts nothing: start_service
+# returns early while settings.enabled is 0.
+/etc/init.d/xray-wg enable 2>/dev/null
+
+# Pick up the new rpcd backend and ACL without a reboot.
+/etc/init.d/rpcd reload 2>/dev/null
+
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
+
+exit 0
