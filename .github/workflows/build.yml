@@ -188,14 +188,42 @@ jobs:
           path: out/
           if-no-files-found: error
 
-      # So the pages job does not have to re-download a 450 MB SDK for one binary.
-      - name: Stash apk-tools for downstream jobs
-        run: cp sdk/staging_dir/host/bin/apk apk-tools
+      # Built here, not in the pages job: the SDK's apk is a wrapper script
+      # that needs the SDK's own loader, so it cannot be copied out on its own.
+      - name: Assemble the signed apk repository
+        working-directory: sdk
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          set -eu
+          if [ -z "${APK_SIGN_KEY:-}" ]; then
+            echo "::warning::APK_SIGN_KEY not set - skipping repository assembly"
+            exit 0
+          fi
+          site="$GITHUB_WORKSPACE/site"
+          mkdir -p "$site"
+          cp "$GITHUB_WORKSPACE/out/${{ steps.build.outputs.apk_name }}" "$site/"
+          cp "$GITHUB_WORKSPACE/pkgsrc/keys/xray-wg-repo.pub.pem" "$site/"
+          cp "$GITHUB_WORKSPACE/pkgsrc/docs/index.html" "$site/"
+          umask 077
+          printf '%s\n' "$APK_SIGN_KEY" > "$RUNNER_TEMP/sign.pem"
+          mkdir -p "$RUNNER_TEMP/trust"
+          cp "$GITHUB_WORKSPACE/pkgsrc/keys/xray-wg-repo.pub.pem" "$RUNNER_TEMP/trust/"
+          # --keys-dir must be absolute: apk silently trusts nothing from a
+          # relative path and then rejects every package as UNTRUSTED.
+          ( cd "$site" && "$GITHUB_WORKSPACE/sdk/staging_dir/host/bin/apk" mkndx \
+              --keys-dir "$RUNNER_TEMP/trust" \
+              --sign-key "$RUNNER_TEMP/sign.pem" \
+              --output packages.adb *.apk )
+          shred -u "$RUNNER_TEMP/sign.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/sign.pem"
+          ls -la "$site"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: apk-tools
-          path: apk-tools
-          if-no-files-found: error
+          name: site
+          path: site/
+          if-no-files-found: warn
+
 
   release:
     needs: build
@@ -234,39 +262,13 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with: { name: luci-app-xray-wg, path: site }
-
-      - uses: actions/download-artifact@v4
-        with: { name: apk-tools, path: bin }
-      - name: Make apk-tools executable
-        # The artifact holds a file named apk-tools, so it lands at bin/apk-tools.
-        run: chmod +x bin/apk-tools && bin/apk-tools --version
-
-      - name: Build the signed repository index
-        env:
-          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        with: { name: site, path: site }
+      - name: Check the repository was assembled
         run: |
           set -eu
-          [ -n "${APK_SIGN_KEY:-}" ] || { echo "::error::APK_SIGN_KEY required to publish a repository"; exit 1; }
-          umask 077
-          printf '%s\n' "$APK_SIGN_KEY" > "$RUNNER_TEMP/sign.pem"
-          rm -f site/SHA256SUMS
-          cp keys/xray-wg-repo.pub.pem site/
-          # Give apk a directory holding only the key.
-          mkdir -p "$RUNNER_TEMP/trust"
-          cp keys/xray-wg-repo.pub.pem "$RUNNER_TEMP/trust/"
-          # --keys-dir must be an absolute path: apk silently loads no keys
-          # from a relative one, and then rejects everything as UNTRUSTED.
-          ( cd site && "$GITHUB_WORKSPACE/bin/apk-tools" mkndx \
-              --keys-dir "$RUNNER_TEMP/trust" \
-              --sign-key "$RUNNER_TEMP/sign.pem" \
-              --output packages.adb *.apk )
-          shred -u "$RUNNER_TEMP/sign.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/sign.pem"
-          cp docs/index.html site/index.html
+          test -f site/packages.adb || { echo "::error::no signed index - is APK_SIGN_KEY set?"; exit 1; }
           ls -la site
-
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with: { path: site }
