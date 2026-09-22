@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-xray-wg
-PKG_VERSION:=1.0.1
+PKG_VERSION:=1.0.2
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-3.0-or-later
 # luci.mk sets PKG_MAINTAINER to the LuCI community; it is not overridable
@@ -34,6 +34,13 @@ LUCI_DEPENDS:= \
 	+jsonfilter \
 	+curl \
 	+ca-bundle
+
+# Without this the config - which holds the WireGuard private key - is
+# replaced on every upgrade. Must be declared before luci.mk, which is where
+# BuildPackage is called.
+define Package/luci-app-xray-wg/conffiles
+/etc/config/xray_wg
+endef
 
 include $(TOPDIR)/feeds/luci/luci.mk
 
