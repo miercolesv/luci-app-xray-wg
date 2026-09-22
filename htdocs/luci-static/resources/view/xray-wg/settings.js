@@ -122,15 +122,36 @@ return view.extend({
 			var pick = self.pickOption
 				? self.pickOption.section.getUIElement('server', '_pick') : null;
 
-			if (pick) {
+			/* Only ui.Dropdown and its subclasses can be re-populated in
+			   place; ui.Select, which form.ListValue renders, cannot. Checked
+			   rather than assumed, so a widget change upstream degrades to a
+			   reload prompt instead of throwing out of the handler. */
+			var live = pick &&
+				typeof pick.clearChoices == 'function' &&
+				typeof pick.addChoices == 'function';
+
+			if (live) {
 				var current = pick.getValue();
-				var labels = {};
-				self.servers.forEach(function(sv) { labels[sv.host] = sv.label; });
+				var values = [], labels = {};
+
+				self.servers.forEach(function(sv) {
+					values.push(sv.host);
+					labels[sv.host] = sv.label;
+				});
+
+				/* clearChoices() drops the configured-but-unlisted entry added
+				   at render time; put it back so a refresh cannot quietly move
+				   the user off the server they are on. */
+				if (current && !labels[current]) {
+					values.unshift(current);
+					labels[current] = '%s (%s)'.format(
+						uci.get('xray_wg', 'server', 'name') || _('configured'), current);
+				}
 
 				pick.clearChoices();
-				pick.addChoices(self.servers.map(function(sv) { return sv.host; }), labels);
+				pick.addChoices(values, labels);
 
-				if (current && labels[current])
+				if (current)
 					pick.setValue(current);
 			}
 
@@ -138,8 +159,10 @@ return view.extend({
 			if (note)
 				note.innerHTML = sourceLabel(self.source, self.servers.length);
 
-			ui.addNotification(null, E('p',
-				_('Fetched %d servers. Pick one, then Save & Apply.')
+			ui.addNotification(null, E('p', live
+				? _('Fetched %d servers. Pick one, then Save & Apply.')
+					.format(self.servers.length)
+				: _('Fetched %d servers. Reload the page to pick one.')
 					.format(self.servers.length)), 'info');
 		}).catch(function(err) {
 			ui.addNotification(null, E('p', _('Refresh failed: %s').format(err.message)), 'error');
@@ -233,7 +256,11 @@ return view.extend({
 		/* A convenience, never a requirement: it must be possible to save a
 		   config that was typed in by hand, and to save a server-list URL
 		   before any list has been fetched. */
-		o = s.option(form.ListValue, '_pick', _('Pick from the list'),
+		/* form.Value rather than form.ListValue: with choices attached it
+		   renders a ui.Combobox, which descends from ui.Dropdown and so can be
+		   re-populated after a refresh. form.ListValue renders a ui.Select,
+		   which has no clearChoices/addChoices at all. */
+		o = s.option(form.Value, '_pick', _('Pick from the list'),
 			_('Fills in the address, the frontend and the peer key together, so the three can never disagree. Leave it alone to keep what is set below.'));
 		o.optional = true;
 		o.write = function() {};
@@ -242,9 +269,18 @@ return view.extend({
 			return uci.get('xray_wg', 'server', 'host') || '';
 		};
 		o.onchange = function(ev, section_id, value) {
-			var sv = self.byHost[value];
-			if (!sv)
+			if (!value)
 				return;
+
+			var sv = self.byHost[value];
+			if (!sv) {
+				/* A Combobox accepts free text. Say so rather than doing
+				   nothing, which reads as the picker being broken. */
+				ui.addNotification(null, E('p',
+					_('"%s" is not in the fetched list - type the server fields in below instead.')
+						.format(value)), 'warning');
+				return;
+			}
 
 			fillFields(serverSection, section_id || 'server', {
 				name: sv.label,
@@ -267,8 +303,12 @@ return view.extend({
 
 		var current = uci.get('xray_wg', 'server', 'host') || '';
 
-		if (!this.servers.length)
-			o.value('', _('-- no list fetched --'));
+		/* Unconditional, and load-bearing: form.Value renders a Combobox only
+		   when it carries at least one choice. With none it falls back to a
+		   plain Textfield, which cannot be re-populated after a refresh - the
+		   empty entry is what guarantees the widget is always the right class. */
+		o.value('', this.servers.length
+			? _('-- pick a server --') : _('-- no list fetched --'));
 
 		/* Keep whatever is configured selectable even if it is absent from the
 		   list we just fetched, so a Save cannot silently move the user off it. */

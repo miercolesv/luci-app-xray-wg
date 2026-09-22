@@ -54,7 +54,10 @@ start_service() {
 	}
 
 	mkdir -p "$XWG_CONF_DIR"
-	if ! "$XWG_GENCONFIG" > "$XWG_XRAY_CONF.new"; then
+	# The generated config carries the VMess id. A subshell umask keeps it
+	# unreadable from the moment the redirect creates it; the chmod below is
+	# then belt and braces rather than the only protection.
+	if ! ( umask 0077; "$XWG_GENCONFIG" > "$XWG_XRAY_CONF.new" ); then
 		xwg_log err "xray config generation failed"
 		rm -f "$XWG_XRAY_CONF.new"
 		xwg_unpin_route
