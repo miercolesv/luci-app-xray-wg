@@ -7,7 +7,10 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-xray-wg
-PKG_VERSION:=1.0.2
+# luci.mk derives LUCI_NAME from the directory name and uses it to look up
+# Build/Prepare/<name>; pin it so the hook is found regardless of staging path.
+LUCI_NAME:=luci-app-xray-wg
+PKG_VERSION:=1.0.3
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-3.0-or-later
 # luci.mk sets PKG_MAINTAINER to the LuCI community; it is not overridable
@@ -40,6 +43,15 @@ LUCI_DEPENDS:= \
 # BuildPackage is called.
 define Package/luci-app-xray-wg/conffiles
 /etc/config/xray_wg
+endef
+
+# git records only the executable bit, so the source file's 0600 does not
+# survive a clone - a release built from one installs the private key
+# world-readable. Set it here instead of trusting the checkout. luci.mk calls
+# this hook from its own Build/Prepare, after the tree has been copied and
+# before Package/install copies it out with cp -pR.
+define Build/Prepare/luci-app-xray-wg
+	chmod 0600 $(PKG_BUILD_DIR)/root/etc/config/xray_wg
 endef
 
 include $(TOPDIR)/feeds/luci/luci.mk
