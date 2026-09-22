@@ -299,7 +299,7 @@ xwg_firewall_apply() {
 
 # Writes human-readable reasons to stderr; returns non-zero if unusable.
 xwg_validate() {
-	local rc=0 mode port vport host frontend peer_pk priv addr mtu iface uuid wgport
+	local rc=0 mode port vport host frontend peer_pk priv addr mtu iface uuid wgport http_host
 
 	mode=$(xwg_get settings mode)
 	port=$(xwg_get settings local_port)
@@ -328,8 +328,14 @@ xwg_validate() {
 	esac
 
 	case "$vport" in
-		''|*[!0-9]*) _fail "settings.vmess_port must be numeric" ;;
+		''|*[!0-9]*) _fail "server.frontend_port must be numeric" ;;
+		*) [ "$vport" -ge 1 ] && [ "$vport" -le 65535 ] || _fail "server.frontend_port out of range" ;;
 	esac
+
+	# genconfig requires it, so catch it here rather than letting config
+	# generation fail with a less obvious message.
+	http_host=$(xwg_get settings http_host)
+	[ -n "$http_host" ] || _fail "settings.http_host is empty (the Host header the frontend expects)"
 
 	[ -n "$iface" ] || _fail "wireguard.iface is empty"
 	[ -n "$host" ] || _fail "server.host is empty"

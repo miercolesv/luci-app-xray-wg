@@ -260,15 +260,21 @@ const methods = {
 		}
 	},
 
+	// `url` lets the UI refresh against a URL the user has typed but not yet
+	// saved. Without it the button could only ever see committed UCI, so
+	// choosing a profile and pressing Refresh in one visit was impossible -
+	// and the config could not be saved first, because nothing is picked yet.
 	refresh: {
-		call: function() {
+		args: { url: '' },
+		call: function(req) {
 			let c = uciCursor();
-			let url = opt(c, 'settings', 'list_url');
+			let url = trim(`${req.args?.url ?? ''}`) || opt(c, 'settings', 'list_url');
 			if (url == '')
 				return withError(readServers(),
-					'no server list URL configured - set it in Settings, or fill the server fields in by hand');
+					'no server list URL - type one into "Server list URL", or fill the server fields in by hand');
 			// Only an absolute http(s) URL, and never passed through a shell
-			// metacharacter path.
+			// metacharacter path. Applied to the argument as well as to the
+			// stored value: the argument is attacker-shaped input either way.
 			if (!match(url, /^https?:\/\/[A-Za-z0-9._~:\/?#@!$&'()*+,;=%-]+$/))
 				return withError(readServers(), 'server list URL is not a plain http(s) URL');
 			let r = run(`curl -fsS --max-time 20 -- '${replace(url, "'", "")}' 2>/dev/null`);

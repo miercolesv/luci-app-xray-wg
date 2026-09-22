@@ -18,11 +18,17 @@ var callProfiles = rpc.declare({
 	method: 'profiles'
 });
 
+/* The URL is passed in rather than read from UCI by the backend: a refresh has
+   to work on a URL that is still only in the form, because nothing can be
+   picked yet and so there is nothing worth saving first. */
 var callRefresh = rpc.declare({
 	object: 'luci.xray-wg',
 	method: 'refresh',
-	params: []
+	params: [ 'url' ]
 });
+
+var WG_KEY_RE = /^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]{2}$/;
+var UUID_RE = /^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/;
 
 /* Accepts a wg-quick style config as produced by most providers and by
    wg-quick itself.
@@ -44,15 +50,20 @@ function parseWgConfig(text) {
 	return out;
 }
 
-/* A read-only row. Deliberately named with a leading underscore: a
-   DummyValue carrying a real option name takes part in the save pass and can
-   drop the option it is only supposed to display. */
-function displayRow(s, name, title, getter) {
-	var o = s.option(form.DummyValue, name, title);
-	o.cfgvalue = getter;
-	o.write = function() {};
-	o.remove = function() {};
-	return o;
+/* Pushes values into sibling widgets of the same section, so they travel
+   through the form's own save path and stay visible and editable. */
+function fillFields(section, section_id, values) {
+	var filled = [];
+
+	for (var key in values) {
+		var el = section.getUIElement(section_id, key);
+		if (el) {
+			el.setValue(values[key]);
+			filled.push(key);
+		}
+	}
+
+	return filled;
 }
 
 function heading(s, name, text) {
@@ -91,10 +102,15 @@ return view.extend({
 		var self = this;
 		var btn = ev.currentTarget;
 
+		/* Whatever is in the field right now, saved or not. */
+		var el = this.settingsSection
+			? this.settingsSection.getUIElement('settings', 'list_url') : null;
+		var url = el ? (el.getValue() || '') : '';
+
 		btn.classList.add('spinning');
 		btn.disabled = true;
 
-		return callRefresh().then(function(res) {
+		return callRefresh(url).then(function(res) {
 			if (!res || !res.servers || !res.servers.length) {
 				ui.addNotification(null, E('p',
 					(res && res.error) || _('Could not fetch the server list.')), 'error');
@@ -103,19 +119,19 @@ return view.extend({
 
 			self.setServers(res.servers, res.source || 'api');
 
-			var el = self.pickOption
+			var pick = self.pickOption
 				? self.pickOption.section.getUIElement('server', '_pick') : null;
 
-			if (el) {
-				var current = el.getValue();
+			if (pick) {
+				var current = pick.getValue();
 				var labels = {};
 				self.servers.forEach(function(sv) { labels[sv.host] = sv.label; });
 
-				el.clearChoices();
-				el.addChoices(self.servers.map(function(sv) { return sv.host; }), labels);
+				pick.clearChoices();
+				pick.addChoices(self.servers.map(function(sv) { return sv.host; }), labels);
 
 				if (current && labels[current])
-					el.setValue(current);
+					pick.setValue(current);
 			}
 
 			var note = document.getElementById('xwg-server-source');
@@ -150,23 +166,27 @@ return view.extend({
 		this.setServers(listing.servers, listing.source);
 
 		var m, s, o;
-		// The profile picker lives in the Server section but writes into the
-		// Tunnel section's options, and getUIElement() only looks inside its
-		// own section - so keep a reference to that section object.
-		var settingsSection = null;
+		/* The profile picker and the Refresh button live in the Server section
+		   but read and write the Tunnel section's options, and getUIElement()
+		   only looks inside its own section - so keep a reference to it.
+		   Options themselves stay in the section that owns their UCI keys. */
+		this.settingsSection = null;
 
 		m = new form.Map('xray_wg', _('Xray WireGuard'),
 			_('Carries WireGuard inside an xray VMess transport. The WireGuard interface, the firewall zone and the host route that keeps the tunnel from swallowing its own uplink are all applied for you.'));
 
 		/* ======================= Server ======================= */
 
-		s = m.section(form.NamedSection, 'server', 'server', _('Server'));
+		s = m.section(form.NamedSection, 'server', 'server', _('Server'),
+			_('Either pick a server from a published list, or type the four values in by hand for a server you run yourself.'));
 		s.anonymous = true;
 		s.addremove = false;
 
+		var serverSection = s;
+
 		if (profiles.length) {
 			o = s.option(form.ListValue, '_profile', _('Profile'),
-				_('Pre-fills the server-list endpoint and the Host header. Everything else still comes from the list, or from what you type below.'));
+				_('Pre-fills the server-list endpoint and the Host header under "Tunnel". Everything else still comes from the list, or from what you type below.'));
 			o.write = function() {};
 			o.remove = function() {};
 			o.cfgvalue = function() {
@@ -177,14 +197,15 @@ return view.extend({
 			profiles.forEach(function(p) { o.value(p.id, p.name); });
 			o.onchange = function(ev, section_id, value) {
 				var p = profiles.filter(function(x) { return x.id === value; })[0];
-				if (!p)
+				if (!p || !self.settingsSection)
 					return;
-				if (!settingsSection)
-					return;
-				var lu = settingsSection.getUIElement('settings', 'list_url');
-				var hh = settingsSection.getUIElement('settings', 'http_host');
-				if (lu) lu.setValue(p.list_url || '');
-				if (hh && p.http_host) hh.setValue(p.http_host);
+
+				var vals = { list_url: p.list_url || '' };
+				if (p.http_host)
+					vals.http_host = p.http_host;
+
+				fillFields(self.settingsSection, 'settings', vals);
+
 				if (p.note)
 					ui.addNotification(null, E('p', p.note), 'info');
 			};
@@ -199,7 +220,8 @@ return view.extend({
 		o.write = function() {};
 		o.remove = function() {};
 
-		o = s.option(form.Button, '_refresh', ' ');
+		o = s.option(form.Button, '_refresh', ' ',
+			_('Fetches the list from "Server list URL" under "Tunnel". The field does not have to be saved first.'));
 		o.inputtitle = _('Refresh server list');
 		o.inputstyle = 'apply';
 		o.write = function() {};
@@ -208,28 +230,45 @@ return view.extend({
 			return self.handleRefresh(ev);
 		};
 
-		o = s.option(form.ListValue, '_pick', _('Server'),
-			_('Picking a server fills in its address, VMess frontend and WireGuard public key together, so the three can never disagree.'));
-		o.rmempty = false;
-		o.write = function(section_id, value) {
-			var sv = self.byHost[value];
-			if (!sv)
-				return;
-			uci.set('xray_wg', 'server', 'host', sv.host);
-			uci.set('xray_wg', 'server', 'v2ray', sv.v2ray);
-			uci.set('xray_wg', 'server', 'public_key', sv.public_key);
-			uci.set('xray_wg', 'server', 'dns_name', sv.dns_name || '');
-			uci.set('xray_wg', 'server', 'name', sv.label);
-		};
+		/* A convenience, never a requirement: it must be possible to save a
+		   config that was typed in by hand, and to save a server-list URL
+		   before any list has been fetched. */
+		o = s.option(form.ListValue, '_pick', _('Pick from the list'),
+			_('Fills in the address, the frontend and the peer key together, so the three can never disagree. Leave it alone to keep what is set below.'));
+		o.optional = true;
+		o.write = function() {};
 		o.remove = function() {};
 		o.cfgvalue = function() {
 			return uci.get('xray_wg', 'server', 'host') || '';
+		};
+		o.onchange = function(ev, section_id, value) {
+			var sv = self.byHost[value];
+			if (!sv)
+				return;
+
+			fillFields(serverSection, section_id || 'server', {
+				name: sv.label,
+				host: sv.host,
+				/* The published list calls this field 'v2ray'; the config
+				   calls it what it is. */
+				frontend: sv.v2ray,
+				public_key: sv.public_key,
+				dns_name: sv.dns_name || '',
+				/* Cleared on purpose: for a listed server both come from the
+				   fetched list, and a value left over from a hand-typed server
+				   would silently take precedence over it. */
+				uuid: '',
+				wg_port: ''
+			});
+
+			ui.addNotification(null, E('p',
+				_('Filled in from %s. Review, then Save & Apply.').format(sv.label)), 'info');
 		};
 
 		var current = uci.get('xray_wg', 'server', 'host') || '';
 
 		if (!this.servers.length)
-			o.value('', _('-- none loaded, press "Refresh server list" --'));
+			o.value('', _('-- no list fetched --'));
 
 		/* Keep whatever is configured selectable even if it is absent from the
 		   list we just fetched, so a Save cannot silently move the user off it. */
@@ -241,18 +280,53 @@ return view.extend({
 
 		this.pickOption = o;
 
-		displayRow(s, '_host_display', _('Server address'), function() {
-			return uci.get('xray_wg', 'server', 'host') || _('none selected');
-		});
+		o = s.option(form.Value, 'name', _('Label'),
+			_('Shown on the Status page. Cosmetic.'));
+		o.placeholder = _('my server');
 
-		displayRow(s, '_v2ray_display', _('VMess frontend'), function() {
-			return uci.get('xray_wg', 'server', 'v2ray') || _('none selected');
-		});
+		o = s.option(form.Value, 'host', _('Server address'),
+			_('Where WireGuard is listening. xray dials it through the transport, so WireGuard itself never learns it.'));
+		o.datatype = 'host';
+		o.placeholder = 'vpn.example.org';
 
-		displayRow(s, '_key_display', _('Peer public key'), function() {
-			var k = uci.get('xray_wg', 'server', 'public_key');
-			return k ? (k.substring(0, 12) + '…') : _('missing - refresh and pick a server');
-		});
+		o = s.option(form.Value, 'wg_port', _('WireGuard port'),
+			_('The port WireGuard listens on at that address. Leave empty only if a fetched server list publishes it.'));
+		o.datatype = 'port';
+		o.placeholder = '51820';
+
+		o = s.option(form.Value, 'frontend', _('VMess frontend address'),
+			_('Where the xray frontend is listening. Often the same address as above.'));
+		o.datatype = 'host';
+		o.placeholder = 'vpn.example.org';
+
+		o = s.option(form.Value, 'frontend_port', _('Frontend port'),
+			_('Port the VMess frontend listens on. 80 and 443 attract the least attention; any port works.'));
+		o.datatype = 'port';
+		o.value('80');
+		o.value('443');
+
+		o = s.option(form.Value, 'uuid', _('VMess id'),
+			_('The user id the frontend expects. Leave empty only if a fetched server list publishes it.'));
+		o.placeholder = '00000000-0000-0000-0000-000000000000';
+		o.validate = function(section_id, value) {
+			if (!value)
+				return true;
+			return UUID_RE.test(value) ? true : _('Not a UUID.');
+		};
+
+		o = s.option(form.Value, 'public_key', _('Peer public key'),
+			_('The server\'s WireGuard public key - not yours.'));
+		o.validate = function(section_id, value) {
+			if (!value)
+				return true;
+			return WG_KEY_RE.test(value) ? true
+				: _('Does not look like a WireGuard key (44 base64 characters).');
+		};
+
+		/* Carried so a picked server keeps the label the list gave it. Hidden
+		   rather than dropped: nothing reads it, but a real widget keeps the
+		   single save path that the picker relies on. */
+		s.option(form.HiddenValue, 'dns_name');
 
 		/* =================== Your credentials =================== */
 		/* One NamedSection per UCI section: two over the same section would
@@ -262,6 +336,8 @@ return view.extend({
 			_('Your own keys, not the server\'s.'));
 		s.anonymous = true;
 		s.addremove = false;
+
+		var wgSection = s;
 
 		o = s.option(form.TextValue, '_import', _('Paste WireGuard config'),
 			_('Optional shortcut. Paste a wg-quick config and press "Fill in fields below". Nothing is stored until you Save.'));
@@ -278,7 +354,7 @@ return view.extend({
 		o.remove = function() {};
 		o.onclick = function(ev, section_id) {
 			var sid = section_id || 'wg';
-			var src = this.section.getUIElement(sid, '_import');
+			var src = wgSection.getUIElement(sid, '_import');
 			var text = src ? (src.getValue() || '') : '';
 
 			if (!text.trim()) {
@@ -286,18 +362,7 @@ return view.extend({
 				return;
 			}
 
-			var parsed = parseWgConfig(text);
-			var filled = [];
-
-			[ 'private_key', 'address', 'dns' ].forEach(function(key) {
-				if (!parsed[key])
-					return;
-				var el = this.section.getUIElement(sid, key);
-				if (el) {
-					el.setValue(parsed[key]);
-					filled.push(key);
-				}
-			}, this);
+			var filled = fillFields(wgSection, sid, parseWgConfig(text));
 
 			if (!filled.length) {
 				ui.addNotification(null, E('p',
@@ -313,21 +378,24 @@ return view.extend({
 				_('Filled in: %s. Review, then Save & Apply.').format(filled.join(', '))), 'info');
 		};
 
+		/* Everything that ships empty is optional here. The service refuses to
+		   start on an incomplete config and says exactly what is missing, so
+		   starting is the gate - saving is not, or a half-filled form could
+		   never be put down and picked up again. */
+
 		o = s.option(form.Value, 'private_key', _('Private key'));
 		o.password = true;
-		o.rmempty = false;
 		o.validate = function(section_id, value) {
 			if (!value)
-				return _('Required.');
-			if (!/^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]{2}$/.test(value))
-				return _('Does not look like a WireGuard key (44 base64 characters).');
-			return true;
+				return true;
+			return WG_KEY_RE.test(value) ? true
+				: _('Does not look like a WireGuard key (44 base64 characters).');
 		};
 
 		o = s.option(form.Value, 'address', _('Assigned address'),
 			_('The address assigned to you, including the prefix length.'));
 		o.datatype = 'cidr';
-		o.rmempty = false;
+		o.placeholder = '172.16.0.2/32';
 
 		o = s.option(form.Value, 'dns', _('DNS server inside the tunnel'),
 			_('Leave empty only if you accept DNS going to the upstream network\'s resolver.'));
@@ -337,6 +405,7 @@ return view.extend({
 
 		o = s.option(form.Value, 'iface', _('Interface name'),
 			_('The network interface this package creates and manages.'));
+		o.datatype = 'uciname';
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'mtu', _('MTU'),
@@ -352,7 +421,7 @@ return view.extend({
 		s = m.section(form.NamedSection, 'settings', 'settings', _('Tunnel'));
 		s.anonymous = true;
 		s.addremove = false;
-		settingsSection = s;
+		this.settingsSection = s;
 
 		o = s.option(form.Flag, 'enabled', _('Enable'),
 			_('Start the tunnel now and on every boot.'));
@@ -362,18 +431,23 @@ return view.extend({
 			_('Only VMess over TCP is implemented and tested.'));
 		o.value('tcp', _('VMess / TCP (HTTP-disguised)'));
 
-		o = s.option(form.ListValue, 'frontend_port', _('Frontend port'),
-			_('Port the VMess frontend listens on.'));
-		o.value('80');
-		o.value('443');
-
 		o = s.option(form.Value, 'list_url', _('Server list URL'),
-			_('Optional. An endpoint publishing servers to choose from. Leave empty for a self-hosted server and fill the fields above by hand.'));
+			_('Optional. An endpoint publishing servers to choose from, used by "Refresh server list" above. Leave empty for a server you run yourself and fill the fields in by hand.'));
 		o.placeholder = 'https://example.org/servers.json';
+		o.validate = function(section_id, value) {
+			if (!value)
+				return true;
+			return /^https?:\/\/[^\s]+$/.test(value) ? true
+				: _('Must be an http:// or https:// URL.');
+		};
+
+		o = s.option(form.Value, 'http_host', _('HTTP Host header'),
+			_('Sent by the disguised TCP transport. Must match what the server expects.'));
+		o.datatype = 'hostname';
+		o.placeholder = 'www.example.com';
 
 		o = s.option(form.Value, 'upstream_iface', _('Uplink interface'),
 			_('The interface carrying the real internet connection. Detected at install time; change it only if detection got it wrong.'));
-		o.rmempty = false;
 		uci.sections('network', 'interface', function(sec) {
 			if (sec['.name'] != 'loopback' &&
 			    sec['.name'] != uci.get('xray_wg', 'wg', 'iface'))
@@ -386,9 +460,6 @@ return view.extend({
 			_('UDP port on loopback where WireGuard hands packets to xray. Pinned rather than random, so the WireGuard peer stays stable across restarts. If it is already taken the service will say so when you press Connect.'));
 		o.datatype = 'port';
 		o.rmempty = false;
-
-		o = s.option(form.Value, 'http_host', _('HTTP Host header'),
-			_('Sent by the disguised TCP transport. Must match what the server expects.'));
 
 		o = s.option(form.ListValue, 'loglevel', _('xray log level'));
 		[ 'none', 'error', 'warning', 'info', 'debug' ].forEach(function(l) {
@@ -406,6 +477,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'zone_name', _('Firewall zone name'));
+		o.datatype = 'uciname';
 		o.depends('manage', '1');
 
 		return m.render();

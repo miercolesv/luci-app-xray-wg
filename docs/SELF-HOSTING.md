@@ -101,19 +101,32 @@ if you want the address to survive someone actually visiting it.
 
 **VPN → Xray WireGuard → Settings**, profile **Self-hosted / manual**:
 
-| Field | Value |
-|---|---|
-| Server address | your VPS address |
-| Server port (WireGuard) | `51820` |
-| Frontend address | the same VPS address |
-| Frontend port | `80` |
-| VMess id | the uuid from step 2 |
-| Server public key | contents of `server.pub` |
-| HTTP Host header | the `Host` you chose in step 2 |
-| Private key / Address | `client.key` and `10.8.0.2/24` |
-| DNS | `10.8.0.1`, or any resolver reachable inside the tunnel |
+Nothing needs fetching: type the values straight in.
 
-Leave **Server list URL** empty. Press Connect.
+| Section | Field | Value |
+|---|---|---|
+| Server | Label | anything you like |
+| Server | Server address | your VPS address |
+| Server | WireGuard port | `51820` |
+| Server | VMess frontend address | the same VPS address |
+| Server | Frontend port | `80` |
+| Server | VMess id | the uuid from step 2 |
+| Server | Peer public key | contents of `server.pub` |
+| Your WireGuard credentials | Private key | contents of `client.key` |
+| Your WireGuard credentials | Assigned address | `10.8.0.2/24` |
+| Your WireGuard credentials | DNS | `10.8.0.1`, or any resolver reachable inside the tunnel |
+| Tunnel | HTTP Host header | the `Host` you chose in step 2 |
+| Tunnel | Server list URL | leave empty |
+
+Leave **Pick from the list** alone - it only exists to fill the Server fields
+from a published list, and there is no list here.
+
+The credentials can also be pasted in whole: **Paste WireGuard config** takes
+a wg-quick file and fills in the private key, address and DNS for you.
+
+Press **Save & Apply**, then **Connect** on the Status tab. An incomplete
+config is still saveable; the service refuses to start and says which field is
+missing.
 
 ## Does it work?
 

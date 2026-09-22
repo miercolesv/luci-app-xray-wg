@@ -28,7 +28,7 @@ fi
 
 iface=$(xwg_get wg iface)
 port=$(xwg_get settings local_port)
-frontend=$(xwg_get server v2ray)
+frontend=$(xwg_get server frontend)
 
 xwg_wait_udp_port "$port" 20 "$GENERATION"
 case $? in

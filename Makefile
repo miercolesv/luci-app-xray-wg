@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-xray-wg
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.1
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-3.0-or-later
 # luci.mk sets PKG_MAINTAINER to the LuCI community; it is not overridable
