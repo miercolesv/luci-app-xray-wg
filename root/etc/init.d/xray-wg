@@ -32,18 +32,22 @@ start_service() {
 	# while we try to read the real uplink's gateway.
 	ifdown "$iface" 2>/dev/null
 
+	# Before pinning anything: a router upgraded from <= 1.0.6 may have no
+	# default route at all, which would make the pin resolve against nothing.
+	xwg_repair_upstream_default
+
 	# On restart procd has only just signalled the previous xray, and the
 	# socket outlives the process briefly. Three seconds turned out not to be
 	# enough on a slow router: the start then refused with "port in use" and
 	# left the tunnel down. Wait longer, and only treat it as a conflict if
 	# something that is not ours is still holding the port.
 	tries=15
-	while xwg_udp_port_busy "$port" && [ "$tries" -gt 0 ]; do
+	while xwg_udp_port_busy "$port" && ! xwg_port_held_by_us && [ "$tries" -gt 0 ]; do
 		tries=$((tries - 1))
 		sleep 1
 	done
-	if xwg_udp_port_busy "$port"; then
-		xwg_log err "UDP port $port is still in use after 15s; pick another settings.local_port"
+	if xwg_udp_port_busy "$port" && ! xwg_port_held_by_us; then
+		xwg_log err "UDP port $port is held by another process; pick another settings.local_port"
 		return 1
 	fi
 
@@ -95,6 +99,11 @@ stop_service() {
 
 	[ -n "$iface" ] && ifdown "$iface" 2>/dev/null
 	xwg_unpin_route
+
+	# Disconnecting must always leave a working uplink behind, whatever state
+	# an older version left the routing table in.
+	xwg_repair_upstream_default
+
 	xwg_log info "stopped"
 }
 

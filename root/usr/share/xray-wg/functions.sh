@@ -303,6 +303,30 @@ xwg_firewall_apply() {
 	return 0
 }
 
+# True when the loopback UDP port is held by the xray this service manages.
+#
+# procd does not retire a running instance until start_service returns, so on a
+# second start our own xray is still holding the port. Treating that as a
+# conflict is worse than useless: start_service fails, procd is handed no
+# instance at all, and it then kills the xray that was working - taking the
+# tunnel with it. Matching on our own config path is exact, because it is the
+# only xray this package ever launches.
+xwg_port_held_by_us() {
+	local pid cmd
+
+	for pid in $(ls /proc 2>/dev/null); do
+		case "$pid" in
+			''|*[!0-9]*) continue ;;
+		esac
+		cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+		case "$cmd" in
+			*"$XWG_XRAY_CONF"*) return 0 ;;
+		esac
+	done
+
+	return 1
+}
+
 # --- netifd readiness ------------------------------------------------------
 
 # netifd marks an interface "available" only once a handler for its proto has
@@ -352,6 +376,43 @@ xwg_wait_device() {
 		i=$((i + 1))
 		sleep 1
 	done
+	return 1
+}
+
+# Up to 1.0.6 this package gave the tunnel a 0.0.0.0/0 route, which replaced
+# the uplink's own default in the kernel at equal metric. netifd never noticed -
+# it still reports the route as present - and it will not reinstate a route it
+# does not believe is missing. A router upgraded from one of those versions is
+# therefore left with no default route at all, and fixing the cause does not
+# undo the damage. Repair the divergence by making netifd re-apply the uplink.
+#
+# Deliberately narrow: it acts only when netifd claims a gateway that the
+# kernel does not have. A setup that legitimately has no default route (policy
+# routing, for instance) claims none either, and is left alone.
+xwg_repair_upstream_default() {
+	local up claimed i=0
+
+	ip -4 route show default 2>/dev/null | grep -q . && return 0
+
+	up=$(xwg_upstream_iface)
+	[ -n "$up" ] || return 1
+
+	claimed=$(xwg_iface_gateway "$up")
+	[ -n "$claimed" ] || return 1
+
+	xwg_log warn "netifd claims a default route via $claimed that the kernel lacks; re-applying uplink '$up'"
+	ifup "$up" 2>/dev/null
+
+	while [ "$i" -lt 20 ]; do
+		ip -4 route show default 2>/dev/null | grep -q . && {
+			xwg_log info "default route via $claimed restored"
+			return 0
+		}
+		i=$((i + 1))
+		sleep 1
+	done
+
+	xwg_log err "uplink '$up' still has no default route after re-applying it"
 	return 1
 }
 
