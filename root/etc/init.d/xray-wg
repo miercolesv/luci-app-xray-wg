@@ -32,15 +32,18 @@ start_service() {
 	# while we try to read the real uplink's gateway.
 	ifdown "$iface" 2>/dev/null
 
-	# On restart procd has only just killed the previous xray; give the socket
-	# a moment to clear before calling it a conflict.
-	tries=3
+	# On restart procd has only just signalled the previous xray, and the
+	# socket outlives the process briefly. Three seconds turned out not to be
+	# enough on a slow router: the start then refused with "port in use" and
+	# left the tunnel down. Wait longer, and only treat it as a conflict if
+	# something that is not ours is still holding the port.
+	tries=15
 	while xwg_udp_port_busy "$port" && [ "$tries" -gt 0 ]; do
 		tries=$((tries - 1))
 		sleep 1
 	done
 	if xwg_udp_port_busy "$port"; then
-		xwg_log err "UDP port $port is already in use; pick another settings.local_port"
+		xwg_log err "UDP port $port is still in use after 15s; pick another settings.local_port"
 		return 1
 	fi
 

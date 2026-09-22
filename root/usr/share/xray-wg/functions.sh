@@ -214,7 +214,15 @@ xwg_sync_network() {
 	uci -q set "network.$peer.public_key=$peer_pk"
 	uci -q set "network.$peer.endpoint_host=127.0.0.1"
 	uci -q set "network.$peer.endpoint_port=$port"
-	uci -q add_list "network.$peer.allowed_ips=0.0.0.0/0"
+	# Two halves rather than 0.0.0.0/0, the way wg-quick does it, and for the
+	# same reason: netifd turns each allowed_ips entry into a route, and a
+	# 0.0.0.0/0 route replaces the uplink's own default at equal metric. netifd
+	# does not notice, so when the tunnel goes down it withdraws its default
+	# and never reinstates the uplink's - leaving the router with no default
+	# route at all. 0.0.0.0/1 and 128.0.0.0/1 cover the same space, still beat
+	# any default on prefix length, and never collide with it.
+	uci -q add_list "network.$peer.allowed_ips=0.0.0.0/1"
+	uci -q add_list "network.$peer.allowed_ips=128.0.0.0/1"
 	uci -q set "network.$peer.route_allowed_ips=1"
 	uci -q set "network.$peer.persistent_keepalive=$keepalive"
 
