@@ -10,7 +10,7 @@ PKG_NAME:=luci-app-xray-wg
 # luci.mk derives LUCI_NAME from the directory name and uses it to look up
 # Build/Prepare/<name>; pin it so the hook is found regardless of staging path.
 LUCI_NAME:=luci-app-xray-wg
-PKG_VERSION:=1.0.4
+PKG_VERSION:=1.0.6
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-3.0-or-later
 # luci.mk sets PKG_MAINTAINER to the LuCI community; it is not overridable

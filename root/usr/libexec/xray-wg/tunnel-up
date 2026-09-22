@@ -53,9 +53,44 @@ xwg_firewall_apply
 
 xwg_generation_is "$GENERATION" || exit 0
 
-if ifup "$iface"; then
+# netifd will accept "up" for an interface whose proto it does not know and
+# then do nothing at all, so wait for it to admit the interface is available
+# before asking. See xwg_iface_available for why a restart is the only cure.
+if ! xwg_wait_iface_available "$iface" 5; then
+	xwg_log warn "netifd has no wireguard proto handler yet; restarting network once"
+	/etc/init.d/network restart >/dev/null 2>&1
+
+	xwg_generation_is "$GENERATION" || exit 0
+
+	if ! xwg_wait_iface_available "$iface" 30; then
+		xwg_log err "netifd still will not accept $iface; is wireguard-tools installed?"
+		exit 1
+	fi
+
+	# Restarting the network tears down the uplink and takes the host route
+	# with it. Wait for the uplink to have an L3 device again before re-pinning:
+	# pinning against a half-built interface fails for a reason that reads like
+	# a misconfiguration and is not one.
+	xwg_wait_upstream 45 || {
+		xwg_log err "uplink did not come back after the network restart"
+		exit 1
+	}
+
+	xwg_generation_is "$GENERATION" || exit 0
+
+	xwg_pin_route "$frontend" || {
+		xwg_log err "lost the pinned route to $frontend across the network restart"
+		exit 1
+	}
+fi
+
+xwg_generation_is "$GENERATION" || exit 0
+
+# ifup is fire-and-forget: it reports success for work netifd may never do, so
+# the device appearing is the only thing worth logging success on.
+if ifup "$iface" && xwg_wait_device "$iface" 15; then
 	xwg_log info "brought up $iface (peer 127.0.0.1:$port -> $frontend)"
 else
-	xwg_log err "ifup $iface failed"
+	xwg_log err "ifup $iface did not produce a device; check 'logread | grep netifd'"
 	exit 1
 fi

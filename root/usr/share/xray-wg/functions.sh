@@ -295,6 +295,58 @@ xwg_firewall_apply() {
 	return 0
 }
 
+# --- netifd readiness ------------------------------------------------------
+
+# netifd marks an interface "available" only once a handler for its proto has
+# been registered, and it scans /lib/netifd/proto only at startup. A wireguard
+# handler installed alongside this package is therefore invisible to the netifd
+# that is already running: `ifup` returns success and silently does nothing, and
+# the device never appears. Verified on OpenWrt 25.12: neither
+# `/etc/init.d/network reload` nor `ubus call network reload` picks the handler
+# up - only a full restart does.
+xwg_iface_available() {
+	ubus call "network.interface.$1" status 2>/dev/null |
+		jsonfilter -e '@.available' 2>/dev/null | grep -qx true
+}
+
+xwg_wait_iface_available() {
+	local iface="$1" tries="${2:-5}" i=0
+	while [ "$i" -lt "$tries" ]; do
+		xwg_iface_available "$iface" && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
+# Usable means netifd has given the uplink an L3 device again - restarting the
+# network tears it down, and a route pinned before it is back fails with
+# "no L3 device", which is indistinguishable from a real misconfiguration.
+xwg_wait_upstream() {
+	local tries="${1:-45}" i=0 up
+	while [ "$i" -lt "$tries" ]; do
+		up=$(xwg_upstream_iface)
+		if [ -n "$up" ] && [ -n "$(xwg_iface_device "$up")" ]; then
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
+# Present once the kernel device exists, which is the only honest proof that
+# ifup did anything.
+xwg_wait_device() {
+	local iface="$1" tries="${2:-15}" i=0
+	while [ "$i" -lt "$tries" ]; do
+		[ -e "/sys/class/net/$iface" ] && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
 # --- Validation ---------------------------------------------------------------
 
 # Writes human-readable reasons to stderr; returns non-zero if unusable.
